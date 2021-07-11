@@ -1,0 +1,314 @@
+# MAIN SCRIPT --- USE TO RUN TURRET AFTER:
+# -> CALIBRATION
+# -> WRITING CALIBRATION PARAMETERS TO A SEPARATE SCRIPT 'calibParameters'
+# -> REMOVING HORIZONTAL OFFSETS BETWEEN CAMERA AND LASER POINTER (USE 'camLaunch' to help)
+# -> ENSURING CAMERA APERTURE AND HORIZONTAL MOTOR AXIS ARE ALIGNED
+# -> ENSURING LASER POINTER IS DIRECTLY ABOVE HORIZONTAL MOTOR'S ROTATION AXIS
+# -> ENSURING LASER IS POINTING STRAIGHT AHEAD
+
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+from calibParameters import criteria, reSize, objp, cam_mtx, coeffDist
+
+np.set_printoptions(precision = 4, suppress = True)
+
+GPIO.setmode(GPIO.BOARD)    # set GPIO numbering mode
+maxDuty = 11.5              # results in 180 degrees (both servos)
+minDuty = 2                 # results in 0 degrees (both servos)
+maxAngle = 180              # max servo angle rating
+
+# Combination of angles for which laser points straight ahead and in-line with camera's optical center
+homeAngleLR = 90
+homeAngleUD = 87.5
+
+minAngle = 0                # min servo angle rating
+cx = cam_mtx[0, 2]          # optical center along x (width)
+cy = cam_mtx[1, 2]          # optical center along y (height)
+
+# For jitter removal
+moveFlag_LR = False         # set to 1 when LR motor moves
+moveFlag_UD = False         # set to 1 when UD motor moves
+centerOld = (0, 0)          # update on frames that motor moves
+dCenter = (0, 0)            # difference of centerOld and current frame center of tracking window
+mobFlag = False             # motor received a signal to move
+frameCnt = 0                # frame counter for explicit time provision to motor for positioning
+
+#---------------------------------------------FUNCTION DEFINITIONS-----------------------------------------------------#
+# To get extrinsic matrix from chessboard using solvePnP. Overall method is same as that of calibration.
+def getExtrinsic(frame):
+    env_objPoints = []
+    env_imgPoints = []
+    if frame is False:
+        print("ERROR: Camera feed not found.")
+    else:
+        img = cv2.resize(frame, reSize, interpolation = cv2.INTER_AREA)
+        cvtGray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cv2.imshow('Raw Input', img)
+        corner_found, corners = cv2.findChessboardCorners(cvtGray, (9, 6), None)
+
+        if corner_found is True:
+            env_objPoints.append(objp)
+            cornersRefined = cv2.cornerSubPix(cvtGray, corners, (4, 4), (-1, -1), criteria)
+            env_imgPoints.append(cornersRefined)
+            img = cv2.drawChessboardCorners(img, (9, 6), cornersRefined, corner_found)
+            cv2.imshow('Input w/ Corners Drawn', img)
+            cv2.waitKey(1)
+        else:
+            print("Chessboard corners not found in first frame.")
+    cv2.destroyAllWindows()
+
+    _, rotV, transV, _ = cv2.solvePnPRansac(env_objPoints[0], env_imgPoints[0], cam_mtx, coeffDist)
+    rotM, _ = cv2.Rodrigues(rotV)
+    em = np.hstack((rotM, transV))
+
+    org = (env_imgPoints[0])[0]
+    org = (org[0, 0], org[0, 1])
+    return em, org
+
+# To solve the reverse PTE given the extrinsic matrix and tracked object pixel coordinates from CamShift. Overall
+# method is same as in verifyCalibration.py.
+
+def getAngles(em, imgPts):
+    # Extract the rotation and translation matrices from extrinsic matrix.
+    rotM = em[0:3, 0:3]
+    transV = em[0:3, 3]
+    # For verification and testing.
+    print("\nYc (non-normalized) = ", transV[1])
+    print("Zc (non-normalized) = ", transV[2])
+    # Vertical offset 'e' and horizontal offset 'd' as measured by ruler. Divide by third element since scaling factor
+    # is 1 (implying division of translation vector by Zc i.e. the third element of translation vector).
+    d = 15/transV[2]
+    e = 8.6/transV[2]
+    print("d = ", d, ", e = ", e)
+
+    u, v = (imgPts[0], imgPts[1])           # for the sake of convention, put the tracked coordinatres as u and v
+    Obj_uv = np.array([[u], [v], [1]])      # form the vector of pixel coordinates
+    inv_cm = np.linalg.inv(cam_mtx)         # take inverse of camera matrix
+
+    # We don't actually need the next 4 code lines as we do not go all the way in the reverse PTE (i.e. from pixel to
+    # world). We require the camera coordinates, which is equivalent to the product of the extrinsic matrix with the
+    # world coordinates vector. Thus, we make this substitution and only get the inverse of the camera matrix for our
+    # purposes. However, this part is left in for the sake of concept and completeness.
+
+    # ************************************************EXTRA START*******************************************************
+    # Inverse of extrinsic matrix is a special form of inverse since it is a homogenous transformation matrix.
+    inv_rotM = rotM.T                       # inverse of rotation matrix is just its transpose
+    inv_em = np.ones((3, 4), np.float32)    # initialize a 3x4 matrix to store the inverse result
+
+    # Fill the first 3 columns and rows with the inverse rotation matrix, and the 4th column with the negative of the
+    # product of inverse 3x3 rotation matrix with the 3x1 translation vector
+    inv_em[0:3, 0:3] = inv_rotM
+    inv_em[0:3, 3] = (-1 * inv_rotM.dot(transV))[0:3]
+    # *************************************************EXTRA END********************************************************
+
+    scaleFact = 1                                   # manually set scaling factor to 1 as only angles are required
+    cam_coords = scaleFact * inv_cm.dot(Obj_uv)     # solve the PTE
+
+    # Print the coordinates vector and separately store each element.
+    print("\nThe camera coordinates (at a specified scale factor) are:\n", cam_coords)
+    Xc = cam_coords[0]
+    Yc = cam_coords[1]
+    Zc = cam_coords[2]
+
+    # Calculate the angles using the camera coordinates. These angles are w.r.t the camera, and still need to be trans-
+    # formed further to get the pointer angles.
+    angleLR_cam = np.degrees(np.arctan(Xc / Zc))
+    angleUD_cam = np.degrees(np.arctan(Yc / Zc))
+    print("\nLR Angle w.r.t Cam =", angleLR_cam)
+    print("UD Angle w.r.t Cam =", angleUD_cam)
+
+    # Return both the horizontal and vertical angles, the camera coordinates, and the offset values.
+    return angleLR_cam, angleUD_cam, Xc, Yc, Zc, d, e
+
+def initServoOnPi(pin):
+    # Set pin as an output, and set PWM output at 50 Hz. Pin must be 32 or 33 on Pi 4.
+    GPIO.setup(pin, GPIO.OUT)
+    s = GPIO.PWM(pin, 50)
+
+    # Start servo with an off pulse and set duty cycle to 0.
+    s.start(0)
+    time.sleep(0.5)
+    s.ChangeDutyCycle(0)
+    time.sleep(0.5)
+    return s
+
+
+#------------------------------------------------MAIN BODY OF CODE-----------------------------------------------------#
+# Initialize both horizontal and vertical servos on Pi 4.
+servoLR = initServoOnPi(33)
+servoUD = initServoOnPi(32)
+# Inititate video capture from webcam connected to Pi 4.
+camON = cv2.VideoCapture(0)
+
+if camON.isOpened() is False:
+    print("Error launching camera.")
+
+else:
+    # To allow auto-exposure adjustments on camera, skip a second's worth of frames
+    for i in range(30):
+        _, _ = camON.read()
+
+    # Read first frame from camera and get the extrinsic matrix. First frame must contain chessboard pattern. This need
+    # only be done once if the extrinsic parameters are saved and the platform does not move afterwards.
+    _, vfFrame = camON.read()
+    extM, origin = getExtrinsic(vfFrame)
+
+    # Ask the user to input the RoI in the frame once extrinsics are calculated.
+    roi_extract = cv2.selectROI("Select ROI Here", vfFrame)
+    x, y, w, h = (roi_extract[0], roi_extract[1], roi_extract[2], roi_extract[3])
+    roi = vfFrame[y: y + h, x: x + w]
+    # Create a tracking window with the above parameters
+    trackWindow = x, y, w, h
+
+    # Convert RoI to HSV colorspace for Cam Shift. Get the histogram and normalize the result to a range of 0-255.
+    roiHSV = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist_roiHSV = cv2.calcHist([roiHSV], [0, 1], None, [180, 256], [0, 180, 0, 256])
+    hist_roiHSV = cv2.normalize(hist_roiHSV, hist_roiHSV, 0, 255, cv2.NORM_MINMAX)
+    # Define a termination criteria for Cam Shift and initialize a frame counter.
+    termCriteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1)
+    frameNo = 0
+
+    while camON.isOpened():
+        _, vFrame = camON.read()    # read new frame at 30 fps
+        frameNo += 1                # advance frame counter
+        print("\n---------------------------------------")
+        print("Frame", frameNo)
+        # Convert incoming frame to HSV space and calculate back projection from the histogram of RoI from first frame.
+        vFrameHSV = cv2.cvtColor(vFrame, cv2.COLOR_BGR2HSV)
+        mask = cv2.calcBackProject([vFrameHSV], [0, 1], hist_roiHSV, [0, 180, 0, 256], 1)
+        # Apply filtering and thresholding to enhance resulting mask.
+        krnl = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
+        mask = cv2.filter2D(mask, -1, krnl)
+        _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
+        # Provide initial tracking window to Cam Shift and update it with the new results.
+        ret, trackWindow = cv2.CamShift(mask, trackWindow, termCriteria)
+
+        pts = cv2.boxPoints(ret)    # extracts the rotated rectangle vertices i.e. the box points
+        pts = np.int0(pts)          # set datatype to int0 = int64 as pixels can only be integers
+
+        # A method to draw polygons, uses the vertices in pts extracted via boxPoints. Note: pts passed as array.
+        result = cv2.polylines(vFrame, [pts], True, (0, 0, 255), 2)
+
+        # Add information on image
+        center = (int(trackWindow[0] + trackWindow[2]/2), int(trackWindow[1] + trackWindow[3]/2))
+        optCtr = (int(cx), int(cy))
+        print("Center =", center)
+
+        # Get angles, then feed them to the servo via PWM
+        LR, UD, Xc, Yc, Zc, d, e = getAngles(extM, center)
+
+        # Perform angular transformations to move from camera aperture to laser pointer module aperture.
+
+        # HORIZONTAL SERVO --- Only one case. arctan will return -ve if object is to the left of home and +ve to the
+        # right of home as Xc is +ve to the right and -ve to the left. For our turret, the horizontal servo has angles
+        # less than 90 to the right and greater than 90 to the left.
+        correctLR = -1*np.degrees(np.arctan( Xc / (Zc + d) ))
+
+        # VERTICAL SERVO --- Three cases. For our turret, straight ahead is home ~87.5. Straight up to the ceiling is 0
+        # degree, and straight down to the floor is 0 degree.
+
+        # CASE 1: Above cam OR ptr
+        if Yc < 0:
+            if abs(Yc) > e:
+                # CASE 1a: above both (subtract angle)
+                correctUD = -1*np.degrees(np.arctan( (abs(Yc) - e) / (Zc + d) ))
+            else:
+                # CASE 1b: above cam and below ptr (add angle)
+                correctUD = np.degrees(np.arctan( (e - abs(Yc)) / (Zc + d) ))
+
+        # CASE 2: below cam and ptr (add angle)
+        else:
+            correctUD = np.degrees(np.arctan(( abs(Yc) + e) / (Zc + d) ))
+
+        print("\nCorrected LR =", correctLR)
+        print("Corrected UD =", correctUD)
+
+        # Calculate duty cycles. Linear response of motor over entire range of PWM assumed.
+        kLR = ( ( (homeAngleLR + correctLR) / maxAngle) * (maxDuty - minDuty)) + minDuty
+        kUD = ( ( (homeAngleUD + correctUD) / maxAngle) * (maxDuty - minDuty)) + minDuty
+        print("kLR =", kLR)
+        print("kUD =", kUD)
+
+        # REFINEMENTS: Perform jitter removal and optimizations
+        dCenter = (abs(center[0] - centerOld[0]), abs(center[1] - centerOld[1]))
+        print("\n***OPTIMIZATION***")
+        print("Old Center =", centerOld)
+        print("dCenter =", dCenter)
+        print("Length(TW):", int(trackWindow[2]/2))
+        print("Width(TW):", int(trackWindow[3]/2))
+
+        # Link motor movement as a threshold of tracking window size.
+        if dCenter[0] > int(trackWindow[2]/2):
+            moveFlag_LR = True                      # horizontal servo moves
+        if dCenter[1] > int(trackWindow[3]/2):
+            moveFlag_UD = True                      # vertical servo moves
+
+        if dCenter[0] < int(trackWindow[2]/2):
+            moveFlag_LR = False                     # horizontal servo remains stationary
+        if dCenter[1] < int(trackWindow[3]/2):
+            moveFlag_UD = False                     # vertical servo remains stationary
+
+        print("\nLR Flag:", moveFlag_LR)
+        print("UD Flag:", moveFlag_UD)
+
+        # Motor must move. If the second or third condition is true, then the motor must be provided time to position on
+        # to tracked object. This is accomplished using a flag that is only set once a motor satisfies the threshold.
+        # Once set, the flag only resets once a set number of frames have passed (each frame is 33 ms). This gives motor
+        # enough time for re-positioning pointer on to new location.
+        if mobFlag is True or moveFlag_UD is True or moveFlag_LR is True:
+            print("Motor is moving...")
+            frameCnt += 1                               # increment motor movement frame counter
+            mobFlag = True                              # flag to ensure motor re-position time
+            servoLR.ChangeDutyCycle(kLR)                # set horizontal servo duty cycle
+            servoUD.ChangeDutyCycle(kUD)                # set vertical servo duty cycle
+            if frameCnt == 10:
+                mobFlag = False                         # reset re-position time flag
+                frameCnt = 0                            # reset motor movement frame counter
+                centerOld = (center[0], center[1])      # update old center
+
+        # If motor movement threshold not satisfied, turn off both motors' PWM pulse.
+        else:
+            servoLR.ChangeDutyCycle(0)
+            servoUD.ChangeDutyCycle(0)
+
+        print("Old Center (Updated) =", centerOld)
+        print("---------------------------------------")
+
+        # Add information to image.
+        result = cv2.circle(result, center, 4, (0, 0, 255), -1)
+        result = cv2.circle(result, optCtr, 4, (0, 128, 255), -1)
+        result = cv2.putText(result, "(u: " + str(center[0]) + ", v: " + str(center[1]) + ")",
+                             (int(center[0] - 150), int(center[1] - 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 200),
+                             2)
+        result = cv2.putText(result, "LR = " + str(correctLR) + "; UD = " + str(correctUD), (2, 15), cv2.FONT_HERSHEY_PLAIN,
+                             1, (255, 0, 0), 1)
+        result = cv2.putText(result, "OptCtr", (int(optCtr[0] - 60), int(optCtr[1])), cv2.FONT_HERSHEY_PLAIN,
+                             1, (0, 128, 255), 1)
+
+        cv2.imshow("Masked Playback", mask)
+        cv2.imshow("Result", result)
+        stopKey = cv2.waitKey(34)
+        if stopKey == 27:
+            break
+
+# Reset motors to home positions.
+time.sleep(0.5)
+servoLR.ChangeDutyCycle(6.7)
+time.sleep(0.5)
+servoUD.ChangeDutyCycle(6.48)
+time.sleep(0.5)
+servoLR.ChangeDutyCycle(0)
+time.sleep(0.5)
+servoUD.ChangeDutyCycle(0)
+time.sleep(0.5)
+
+# Stop servos and cleanup GPIO ports.
+servoLR.stop()
+servoUD.stop()
+GPIO.cleanup()
+
+# Stop video capture.
+camON.release()
+cv2.destroyAllWindows()
